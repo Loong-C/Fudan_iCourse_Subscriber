@@ -16,6 +16,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: icourse-database-writer
+  cancel-in-progress: false
+
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -96,10 +100,12 @@ jobs:
           fi
 
       - name: Decode database
+        id: db-decode
         if: hashFiles('data/sharded/icourse-index.enc', 'data/icourse.db.gz.enc', 'data/icourse.db.enc') != ''
         env:
           STUID: ${{ secrets.STUID }}
           UISPSW: ${{ secrets.UISPSW }}
+          PREVIOUS_UISPSW: ${{ secrets.PREVIOUS_UISPSW }}
           DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
         run: |
@@ -135,15 +141,15 @@ jobs:
               gzip -d data/icourse.db.gz
               echo "Legacy compressed DB decrypted ($VER)."
             else
-              echo "::warning::Decryption failed (both keys). Starting with fresh database."
-              rm -f data/icourse.db data/icourse.db.gz
+              echo "::error::Database decryption failed. Preserve the data branch and check the original credentials."
+              exit 1
             fi
           elif [ -f data/icourse.db.enc ]; then
             if VER=$(decrypt_blob data/icourse.db.enc data/icourse.db); then
               echo "Legacy uncompressed DB decrypted ($VER)."
             else
-              echo "::warning::Decryption failed (both keys). Starting with fresh database."
-              rm -f data/icourse.db
+              echo "::error::Database decryption failed. Preserve the data branch and check the original credentials."
+              exit 1
             fi
           fi
 
@@ -177,10 +183,11 @@ jobs:
           python -u main.py
 
       - name: Deploy database to data branch
-        if: always()
+        if: ${{ always() && steps.db-before.outcome == 'success' && (steps.db-decode.outcome == 'success' || steps.db-decode.outcome == 'skipped') }}
         env:
           STUID: ${{ secrets.STUID }}
           UISPSW: ${{ secrets.UISPSW }}
+          PREVIOUS_UISPSW: ${{ secrets.PREVIOUS_UISPSW }}
           DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -191,7 +198,8 @@ jobs:
           fi
 
           AFTER=$(md5sum data/icourse.db | cut -d' ' -f1)
-          if [ "$AFTER" = "${{ steps.db-before.outputs.hash }}" ]; then
+          if [ "$AFTER" = "${{ steps.db-before.outputs.hash }}" ] && \
+             [ "${{ steps.db-decode.outputs.db_key_version }}" != "previous" ]; then
             echo "Database unchanged, skipping commit."
             exit 0
           fi
@@ -212,6 +220,10 @@ jobs:
             echo "Merging local changes into latest remote..."
             python scripts/merge_db.py data/icourse.db data/remote.db
             DEPLOY_DB=data/remote.db
+          fi
+
+          if [ "${{ steps.db-decode.outputs.db_key_version }}" = "previous" ]; then
+            git push origin "refs/remotes/origin/data:refs/heads/data-before-password-rotation-${{ github.run_id }}"
           fi
 
           rm -rf data/sharded_out

@@ -211,6 +211,29 @@ PPT 功能区 UI 噪声清洗：PowerPoint 功能区标签（"文件""开始""�
 
 ### 数据库持久化：三环境兼容的加密 + 内容寻址分片
 
+#### 更换 UIS 密码后恢复运行
+
+数据库密钥由学号和 UIS 密码派生。只更新 `UISPSW` 会导致旧数据库无法解密，
+出现 `Padding is incorrect` 等错误；这与 SMTP 邮箱密码无关。
+
+1. 将 `UISPSW` 更新为新的学校登录密码。
+2. 在仓库 Actions Secrets 中新增 `PREVIOUS_UISPSW`，填入更换前的旧密码。
+   不要把密码写入代码、日志或工作流输入框。
+3. 手动运行 **iCourse Check**，勾选 `recovery_only`。它会验证当前学校登录、
+   用旧密码恢复分片，并用新密码重新加密；不处理课程或发送邮件。
+   即使课程数据没有变化也会执行密钥迁移，并保留
+   `data-before-password-rotation-<run_id>` 加密备份分支。
+4. 成功后删除 `PREVIOUS_UISPSW` Secret，再正常运行 **iCourse Check**。
+   网页端之后使用新密码解密；旧备份仍需要旧密码。
+
+旧密码回退仅用于分片格式，所有新写入都使用当前 `UISPSW`。解密失败时停止，
+不自动清空历史记录；分片完整恢复并通过 SQLite 检查后才生成待部署数据库。
+若旧密码已遗失，需要另行决定如何处理旧数据，不能通过重试恢复加密内容。
+
+排查邮件时，请同时检查 Actions 是否实际产生每日运行记录。工作流显示启用，
+不能证明过去每天都触发过；日志中的 `[Emailer] Sent` 表示 SMTP 已接受发送，
+收件箱是否投递成功还需在邮箱确认。
+
 GitHub Actions 每次在全新容器中运行，无法依赖本地文件系统持久化。解决方案是独立的 `data` 分支，每次运行结束时加密推送数据库，下次运行时拉取解密。
 
 AES-256-CBC + PBKDF2 加密方案需要在三种环境中同时兼容：GitHub Actions shell（openssl CLI）、Python（pycryptodome 库）、浏览器前端（Web Crypto API）。`crypto_box.py` 和 `frontend/js/crypto.js` 保持精确对应——相同的 Salted__ 头部格式、相同的 PBKDF2 迭代次数、相同的 AES-256-CBC 模式。密钥由 `sha256("ICSv2:" + stuid + ":" + uispsw)` 派生。

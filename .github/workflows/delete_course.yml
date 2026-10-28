@@ -17,7 +17,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: db-reset
+  group: icourse-database-writer
   cancel-in-progress: false
 
 jobs:
@@ -42,6 +42,7 @@ jobs:
         env:
           STUID: ${{ secrets.STUID }}
           UISPSW: ${{ secrets.UISPSW }}
+          PREVIOUS_UISPSW: ${{ secrets.PREVIOUS_UISPSW }}
         run: |
           git fetch origin data --depth=1
           mkdir -p data/sharded/shards
@@ -99,6 +100,7 @@ jobs:
         env:
           STUID: ${{ secrets.STUID }}
           UISPSW: ${{ secrets.UISPSW }}
+          PREVIOUS_UISPSW: ${{ secrets.PREVIOUS_UISPSW }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Shard into a fresh directory — data/sharded still holds the

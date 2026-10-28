@@ -6,9 +6,18 @@ on:
     # 设计这个奇怪的时间是为了避免整点时的github队列峰值，避免排队过久。
     - cron: "36 11 * * *"
   workflow_dispatch:
+    inputs:
+      recovery_only:
+        description: "Verify login and migrate the database key without processing lectures or sending mail"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
+
+concurrency:
+  group: icourse-database-writer
+  cancel-in-progress: false
 
 jobs:
   check:
@@ -35,11 +44,13 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Install ffmpeg
+        if: inputs.recovery_only != true
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
 
       - name: Cache ASR models
+        if: inputs.recovery_only != true
         id: cache-models
         uses: actions/cache@v4
         with:
@@ -49,7 +60,7 @@ jobs:
           key: asr-models-sense-voice-2024-07-17
 
       - name: Download ASR models
-        if: steps.cache-models.outputs.cache-hit != 'true'
+        if: inputs.recovery_only != true && steps.cache-models.outputs.cache-hit != 'true'
         run: |
           wget -q https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2
           tar xf sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2
@@ -57,6 +68,7 @@ jobs:
           wget -q https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx
 
       - name: Cache RapidOCR models
+        if: inputs.recovery_only != true
         uses: actions/cache@v4
         with:
           path: ~/.cache/rapidocr
@@ -99,10 +111,12 @@ jobs:
           fi
 
       - name: Decode database
+        id: db-decode
         if: hashFiles('data/sharded/icourse-index.enc', 'data/icourse.db.gz.enc', 'data/icourse.db.enc') != ''
         env:
           STUID: ${{ secrets.STUID }}
           UISPSW: ${{ secrets.UISPSW }}
+          PREVIOUS_UISPSW: ${{ secrets.PREVIOUS_UISPSW }}
           DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
         run: |
@@ -140,15 +154,15 @@ jobs:
               gzip -d data/icourse.db.gz
               echo "Legacy compressed DB decrypted ($VER)."
             else
-              echo "::warning::Decryption failed (both keys). Starting with fresh database."
-              rm -f data/icourse.db data/icourse.db.gz
+              echo "::error::Database decryption failed. Preserve the data branch and check the original credentials."
+              exit 1
             fi
           elif [ -f data/icourse.db.enc ]; then
             if VER=$(decrypt_blob data/icourse.db.enc data/icourse.db); then
               echo "Legacy uncompressed DB decrypted ($VER)."
             else
-              echo "::warning::Decryption failed (both keys). Starting with fresh database."
-              rm -f data/icourse.db
+              echo "::error::Database decryption failed. Preserve the data branch and check the original credentials."
+              exit 1
             fi
           fi
 
@@ -161,7 +175,16 @@ jobs:
             echo "hash=none" >> $GITHUB_OUTPUT
           fi
 
+      - name: Verify current login
+        id: verify-login
+        if: inputs.recovery_only == true
+        env:
+          StuId: ${{ secrets.STUID }}
+          UISPsw: ${{ secrets.UISPSW }}
+        run: python -u scripts/verify_login.py
+
       - name: Run
+        if: inputs.recovery_only != true
         timeout-minutes: 350
         env:
           StuId: ${{ secrets.STUID }}
@@ -182,10 +205,11 @@ jobs:
           python -u main.py
 
       - name: Deploy database to data branch
-        if: always()
+        if: ${{ always() && steps.db-before.outcome == 'success' && (steps.db-decode.outcome == 'success' || steps.db-decode.outcome == 'skipped') && (inputs.recovery_only != true || steps.verify-login.outcome == 'success') }}
         env:
           STUID: ${{ secrets.STUID }}
           UISPSW: ${{ secrets.UISPSW }}
+          PREVIOUS_UISPSW: ${{ secrets.PREVIOUS_UISPSW }}
           COURSE_IDS: ${{ secrets.COURSE_IDS }}
           # Persisted by the sharder into meta('subscribed_course_ids')
           # so single_run.yml / delete_course.yml (which run with a
@@ -202,7 +226,8 @@ jobs:
           fi
 
           AFTER=$(md5sum data/icourse.db | cut -d' ' -f1)
-          if [ "$AFTER" = "${{ steps.db-before.outputs.hash }}" ]; then
+          if [ "$AFTER" = "${{ steps.db-before.outputs.hash }}" ] && \
+             [ "${{ steps.db-decode.outputs.db_key_version }}" != "previous" ]; then
             echo "Database unchanged, skipping commit."
             exit 0
           fi
@@ -225,6 +250,11 @@ jobs:
             echo "Merging local changes into latest remote..."
             python scripts/merge_db.py data/icourse.db data/remote.db
             DEPLOY_DB=data/remote.db
+          fi
+
+          # Preserve the old encrypted snapshot before a password migration.
+          if [ "${{ steps.db-decode.outputs.db_key_version }}" = "previous" ]; then
+            git push origin "refs/remotes/origin/data:refs/heads/data-before-password-rotation-${{ github.run_id }}"
           fi
 
           # Re-shard the merged DB and stage to a clean tree for force-push.
